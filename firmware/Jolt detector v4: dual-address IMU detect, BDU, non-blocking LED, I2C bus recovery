@@ -1,0 +1,260 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : MotoBox jolt detector - mastery version
+  *                   LSM6DSL (IKS01A2) on I2C1: PB7 = SDA (D4), PB6 = SCL (D5)
+  *                   - finds the IMU at 0x6B or 0x6A
+  *                   - 208 Hz, +-16 g, block data update
+  *                   - non-blocking: keeps sampling while the LED is on
+  *                   - I2C bus recovery if a wire glitch locks the bus
+  *                   - never freezes: auto-reconnects forever
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+#include "main.h"
+
+/* ---------------- Settings ---------------- */
+#define REG_WHO_AM_I   0x0F     /* LSM6DSL answers 0x6A                 */
+#define REG_CTRL1_XL   0x10     /* accel: data rate + range             */
+#define REG_CTRL3_C    0x12     /* BDU + register auto-increment        */
+#define REG_OUTX_L_XL  0x28     /* first of 6 accel data bytes          */
+#define LSB_PER_G      2049     /* +-16 g: 0.488 mg per LSB             */
+#define JOLT_G         2        /* event threshold (g)                  */
+#define LED_ON_MS      1000     /* LED time per event                   */
+#define SAMPLE_MS      5        /* ~200 readings per second             */
+#define FAILS_TO_LOSE  3        /* failed reads before recovery         */
+
+I2C_HandleTypeDef hi2c1;
+static uint16_t imu_addr = 0;
+static uint32_t event_count = 0;   /* number of jolts detected (view in debugger) */
+
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static HAL_StatusTypeDef i2c_init(void);
+
+/* ---------------- LED helpers ---------------- */
+static void led(GPIO_PinState s) { HAL_GPIO_WritePin(GPIOB, GPIO_PIN_3, s); }
+
+static void quick_blinks(int n)
+{
+  for (int i = 0; i < n; i++)
+  {
+    led(GPIO_PIN_SET);   HAL_Delay(150);
+    led(GPIO_PIN_RESET); HAL_Delay(150);
+  }
+}
+
+/* ---------------- I2C bus recovery ----------------
+   If a sensor is stuck holding SDA low (e.g. after a wire glitch mid-transfer),
+   clock SCL 9 times by hand and send a STOP, then restart the I2C peripheral. */
+static void i2c_bus_recover(void)
+{
+  HAL_I2C_DeInit(&hi2c1);
+
+  GPIO_InitTypeDef g = {0};
+  g.Pin   = GPIO_PIN_6 | GPIO_PIN_7;
+  g.Mode  = GPIO_MODE_OUTPUT_OD;
+  g.Pull  = GPIO_PULLUP;
+  g.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6 | GPIO_PIN_7, GPIO_PIN_SET);
+  HAL_GPIO_Init(GPIOB, &g);
+  HAL_Delay(1);
+
+  for (int i = 0; i < 9; i++)                      /* 9 clock pulses on SCL */
+  {
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET); HAL_Delay(1);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);   HAL_Delay(1);
+  }
+
+  /* STOP condition: SDA goes low -> high while SCL is high */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_RESET); HAL_Delay(1);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);   HAL_Delay(1);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_SET);   HAL_Delay(1);
+
+  HAL_GPIO_DeInit(GPIOB, GPIO_PIN_6 | GPIO_PIN_7);
+  i2c_init();                                      /* back to I2C mode */
+}
+
+/* ---------------- IMU start ----------------
+   Finds the LSM6DSL at either address and switches the accelerometer on. */
+static int imu_start(void)
+{
+  uint16_t candidates[2] = { 0x6B << 1, 0x6A << 1 };
+
+  for (int i = 0; i < 2; i++)
+  {
+    uint8_t who = 0;
+    if (HAL_I2C_Mem_Read(&hi2c1, candidates[i], REG_WHO_AM_I,
+                         I2C_MEMADD_SIZE_8BIT, &who, 1, 50) == HAL_OK && who == 0x6A)
+    {
+      imu_addr = candidates[i];
+      uint8_t ctrl3 = 0x44;   /* BDU = 1, IF_INC = 1 */
+      uint8_t ctrl1 = 0x54;   /* 208 Hz, +-16 g      */
+      if (HAL_I2C_Mem_Write(&hi2c1, imu_addr, REG_CTRL3_C, I2C_MEMADD_SIZE_8BIT, &ctrl3, 1, 50) != HAL_OK) return 0;
+      if (HAL_I2C_Mem_Write(&hi2c1, imu_addr, REG_CTRL1_XL, I2C_MEMADD_SIZE_8BIT, &ctrl1, 1, 50) != HAL_OK) return 0;
+      HAL_Delay(20);
+      return 1;
+    }
+  }
+  return 0;
+}
+
+int main(void)
+{
+  HAL_Init();
+  SystemClock_Config();
+  MX_GPIO_Init();
+  i2c_init();
+  HAL_Delay(100);
+
+  /* 1. Find the IMU. Fast flicker while searching, never freezes. */
+  while (!imu_start())
+  {
+    led(GPIO_PIN_SET);   HAL_Delay(50);
+    led(GPIO_PIN_RESET); HAL_Delay(50);
+    i2c_bus_recover();
+  }
+
+  /* 3 quick blinks = IMU found and running */
+  quick_blinks(3);
+
+  /* 2. Main loop: sample, detect jolts, recover if the sensor is lost */
+  const int64_t limit = (int64_t)(JOLT_G * LSB_PER_G) * (JOLT_G * LSB_PER_G);
+  uint32_t led_off_at = 0;
+  int led_on = 0;
+  int fails = 0;
+
+  while (1)
+  {
+    uint32_t now = HAL_GetTick();
+    uint8_t d[6];
+
+    if (HAL_I2C_Mem_Read(&hi2c1, imu_addr, REG_OUTX_L_XL,
+                         I2C_MEMADD_SIZE_8BIT, d, 6, 20) == HAL_OK)
+    {
+      fails = 0;
+
+      int16_t ax = (int16_t)(d[1] << 8 | d[0]);
+      int16_t ay = (int16_t)(d[3] << 8 | d[2]);
+      int16_t az = (int16_t)(d[5] << 8 | d[4]);
+      int64_t mag2 = (int64_t)ax * ax + (int64_t)ay * ay + (int64_t)az * az;
+
+      if (mag2 > limit)
+      {
+        if (!led_on) event_count++;      /* count each new event once */
+        led(GPIO_PIN_SET);
+        led_on = 1;
+        led_off_at = now + LED_ON_MS;    /* LED stays on 1 s after the LAST jolt */
+      }
+    }
+    else
+    {
+      fails++;
+      if (fails >= FAILS_TO_LOSE)
+      {
+        /* Sensor lost: fast flicker while recovering, then carry on */
+        while (1)
+        {
+          led(GPIO_PIN_SET);   HAL_Delay(50);
+          led(GPIO_PIN_RESET); HAL_Delay(50);
+          i2c_bus_recover();
+          if (imu_start()) break;
+        }
+        quick_blinks(1);                 /* 1 blink = reconnected */
+        fails = 0;
+        led_on = 0;
+      }
+    }
+
+    /* Turn the LED off when its 1 s is up (without stopping the sampling) */
+    if (led_on && (int32_t)(HAL_GetTick() - led_off_at) >= 0)
+    {
+      led(GPIO_PIN_RESET);
+      led_on = 0;
+    }
+
+    HAL_Delay(SAMPLE_MS);
+  }
+}
+
+/* ---------------- I2C1 init (no freeze on failure) ---------------- */
+static HAL_StatusTypeDef i2c_init(void)
+{
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.Timing = 0x00100D14;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK) return HAL_ERROR;
+  if (HAL_I2CEx_ConfigAnalogFilter(&hi2c1, I2C_ANALOGFILTER_ENABLE) != HAL_OK) return HAL_ERROR;
+  if (HAL_I2CEx_ConfigDigitalFilter(&hi2c1, 0) != HAL_OK) return HAL_ERROR;
+  return HAL_OK;
+}
+
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  if (HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_MSI;
+  RCC_OscInitStruct.MSIState = RCC_MSI_ON;
+  RCC_OscInitStruct.MSICalibrationValue = 0;
+  RCC_OscInitStruct.MSIClockRange = RCC_MSIRANGE_6;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_MSI;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_3, GPIO_PIN_RESET);
+
+  GPIO_InitStruct.Pin = GPIO_PIN_3;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+}
+
+void Error_Handler(void)
+{
+  __disable_irq();
+  while (1)
+  {
+  }
+}
+
+#ifdef USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line)
+{
+}
+#endif
