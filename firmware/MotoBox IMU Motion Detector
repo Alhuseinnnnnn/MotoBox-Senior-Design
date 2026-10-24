@@ -1,0 +1,288 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : MotoBox motion test (professor goal)
+  *                   - startup: one 1 s glow = IMU found
+  *                   - moving  -> LED blinks 3 times (once per motion start)
+  *                   - still   -> LED off
+  *                   Uses LSM6DSL (IKS01A2) gyro + accel on I2C1:
+  *                   PB7 = SDA (D4), PB6 = SCL (D5)
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+#include "main.h"
+
+/* LSM6DSL registers */
+#define REG_WHO_AM_I    0x0F
+#define REG_CTRL1_XL    0x10   /* accel ODR + range        */
+#define REG_CTRL2_G     0x11   /* gyro ODR + range         */
+#define REG_CTRL3_C     0x12   /* BDU, auto-increment      */
+#define REG_OUTX_L_G    0x22   /* gyro X,Y,Z then accel X,Y,Z = 12 bytes */
+
+/* Scaling */
+#define ACC_LSB_PER_G       2048.0f     /* +-16 g  */
+#define GYRO_DPS_PER_LSB    0.00875f    /* +-250 dps */
+
+/* Motion thresholds - tune these by feel */
+#define GYRO_MOVE_DPS       20.0f       /* spin faster than this = moving */
+#define ACC_LO_G            0.85f       /* |a| below this = moving */
+#define ACC_HI_G            1.15f       /* |a| above this = moving */
+#define STILL_MS            500         /* must be quiet this long to re-arm */
+
+#define SAMPLE_MS           5
+#define FAILS_TO_LOSE       3
+
+I2C_HandleTypeDef hi2c1;
+static uint16_t imu_addr = 0;
+
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static HAL_StatusTypeDef i2c_init(void);
+
+static void led(GPIO_PinState s) { HAL_GPIO_WritePin(GPIOB, GPIO_PIN_3, s); }
+
+/* 3 quick blinks = motion detected */
+static void triple_blink(void)
+{
+  for (int i = 0; i < 3; i++)
+  {
+    led(GPIO_PIN_SET);   HAL_Delay(150);
+    led(GPIO_PIN_RESET); HAL_Delay(150);
+  }
+}
+
+/* 1 long glow = IMU found at startup */
+static void startup_glow(void)
+{
+  led(GPIO_PIN_SET);   HAL_Delay(1000);
+  led(GPIO_PIN_RESET); HAL_Delay(300);
+}
+
+static void i2c_bus_recover(void)
+{
+  HAL_I2C_DeInit(&hi2c1);
+
+  GPIO_InitTypeDef g = {0};
+  g.Pin   = GPIO_PIN_6 | GPIO_PIN_7;
+  g.Mode  = GPIO_MODE_OUTPUT_OD;
+  g.Pull  = GPIO_PULLUP;
+  g.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6 | GPIO_PIN_7, GPIO_PIN_SET);
+  HAL_GPIO_Init(GPIOB, &g);
+  HAL_Delay(1);
+
+  for (int i = 0; i < 9; i++)
+  {
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET); HAL_Delay(1);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);   HAL_Delay(1);
+  }
+
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_RESET); HAL_Delay(1);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);   HAL_Delay(1);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_SET);   HAL_Delay(1);
+
+  HAL_GPIO_DeInit(GPIOB, GPIO_PIN_6 | GPIO_PIN_7);
+  i2c_init();
+}
+
+static int imu_start(void)
+{
+  uint16_t candidates[2] = { 0x6B << 1, 0x6A << 1 };
+
+  for (int i = 0; i < 2; i++)
+  {
+    uint8_t who = 0;
+    if (HAL_I2C_Mem_Read(&hi2c1, candidates[i], REG_WHO_AM_I,
+                         I2C_MEMADD_SIZE_8BIT, &who, 1, 50) == HAL_OK && who == 0x6A)
+    {
+      imu_addr = candidates[i];
+      uint8_t ctrl3 = 0x44;   /* BDU = 1, IF_INC = 1           */
+      uint8_t ctrl1 = 0x54;   /* accel 208 Hz, +-16 g          */
+      uint8_t ctrl2 = 0x50;   /* gyro 208 Hz, 250 dps          */
+      if (HAL_I2C_Mem_Write(&hi2c1, imu_addr, REG_CTRL3_C, I2C_MEMADD_SIZE_8BIT, &ctrl3, 1, 50) != HAL_OK) return 0;
+      if (HAL_I2C_Mem_Write(&hi2c1, imu_addr, REG_CTRL1_XL, I2C_MEMADD_SIZE_8BIT, &ctrl1, 1, 50) != HAL_OK) return 0;
+      if (HAL_I2C_Mem_Write(&hi2c1, imu_addr, REG_CTRL2_G,  I2C_MEMADD_SIZE_8BIT, &ctrl2, 1, 50) != HAL_OK) return 0;
+      HAL_Delay(20);
+      return 1;
+    }
+  }
+  return 0;
+}
+
+int main(void)
+{
+  HAL_Init();
+  SystemClock_Config();
+  MX_GPIO_Init();
+  i2c_init();
+  HAL_Delay(100);
+
+  while (!imu_start())
+  {
+    led(GPIO_PIN_SET);   HAL_Delay(50);
+    led(GPIO_PIN_RESET); HAL_Delay(50);
+    i2c_bus_recover();
+  }
+
+  startup_glow();
+
+  const float LO2 = ACC_LO_G * ACC_LO_G;
+  const float HI2 = ACC_HI_G * ACC_HI_G;
+  const float GYRO2_LIMIT = GYRO_MOVE_DPS * GYRO_MOVE_DPS;
+
+  int moving = 0;
+  uint32_t last_motion = 0;
+  int fails = 0;
+
+  while (1)
+  {
+    uint8_t d[12];
+
+    if (HAL_I2C_Mem_Read(&hi2c1, imu_addr, REG_OUTX_L_G,
+                         I2C_MEMADD_SIZE_8BIT, d, 12, 20) == HAL_OK)
+    {
+      fails = 0;
+
+      /* gyro bytes 0..5, accel bytes 6..11 (little-endian pairs) */
+      int16_t rgx = (int16_t)((d[1]  << 8) | d[0]);
+      int16_t rgy = (int16_t)((d[3]  << 8) | d[2]);
+      int16_t rgz = (int16_t)((d[5]  << 8) | d[4]);
+      int16_t rax = (int16_t)((d[7]  << 8) | d[6]);
+      int16_t ray = (int16_t)((d[9]  << 8) | d[8]);
+      int16_t raz = (int16_t)((d[11] << 8) | d[10]);
+
+      /* gyro: squared magnitude in deg/s */
+      float gx = rgx * GYRO_DPS_PER_LSB;
+      float gy = rgy * GYRO_DPS_PER_LSB;
+      float gz = rgz * GYRO_DPS_PER_LSB;
+      float gyro2 = gx * gx + gy * gy + gz * gz;
+
+      /* accel: squared magnitude in g (still = 1 g) */
+      float ax = rax / ACC_LSB_PER_G;
+      float ay = ray / ACC_LSB_PER_G;
+      float az = raz / ACC_LSB_PER_G;
+      float acc2 = ax * ax + ay * ay + az * az;
+
+      int shaking = (gyro2 > GYRO2_LIMIT) || (acc2 < LO2) || (acc2 > HI2);
+      uint32_t now = HAL_GetTick();
+
+      if (shaking)
+      {
+        last_motion = now;
+        if (!moving)
+        {
+          moving = 1;
+          triple_blink();          /* the 3 blinks */
+          last_motion = HAL_GetTick();
+        }
+      }
+      else if (moving && (int32_t)(now - last_motion) >= STILL_MS)
+      {
+        moving = 0;                /* quiet long enough: re-arm */
+      }
+      /* LED stays OFF whenever we are not inside triple_blink() */
+    }
+    else
+    {
+      fails++;
+      if (fails >= FAILS_TO_LOSE)
+      {
+        /* sensor lost: fast flicker until it comes back */
+        while (1)
+        {
+          led(GPIO_PIN_SET);   HAL_Delay(50);
+          led(GPIO_PIN_RESET); HAL_Delay(50);
+          i2c_bus_recover();
+          if (imu_start()) break;
+        }
+        led(GPIO_PIN_SET);   HAL_Delay(150);
+        led(GPIO_PIN_RESET);
+        fails = 0;
+        moving = 0;
+      }
+    }
+
+    HAL_Delay(SAMPLE_MS);
+  }
+}
+
+static HAL_StatusTypeDef i2c_init(void)
+{
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.Timing = 0x00100D14;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK) return HAL_ERROR;
+  if (HAL_I2CEx_ConfigAnalogFilter(&hi2c1, I2C_ANALOGFILTER_ENABLE) != HAL_OK) return HAL_ERROR;
+  if (HAL_I2CEx_ConfigDigitalFilter(&hi2c1, 0) != HAL_OK) return HAL_ERROR;
+  return HAL_OK;
+}
+
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  if (HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_MSI;
+  RCC_OscInitStruct.MSIState = RCC_MSI_ON;
+  RCC_OscInitStruct.MSICalibrationValue = 0;
+  RCC_OscInitStruct.MSIClockRange = RCC_MSIRANGE_6;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_MSI;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_3, GPIO_PIN_RESET);
+
+  GPIO_InitStruct.Pin = GPIO_PIN_3;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+}
+
+void Error_Handler(void)
+{
+  __disable_irq();
+  while (1)
+  {
+  }
+}
+
+#ifdef USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line)
+{
+}
+#endif
